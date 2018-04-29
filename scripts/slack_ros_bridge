@@ -1,0 +1,135 @@
+#!/usr/bin/env python
+from StringIO import StringIO
+
+import cv2
+import numpy as np
+import rospy
+from cv_bridge import CvBridge
+from slackclient import SlackClient
+from std_msgs.msg import String
+from sensor_msgs.msg import Image
+import requests
+
+
+# Node example class.
+class SlackROS(object):
+    def __init__(self):
+        # Get the ~private namespace parameters from command line or launch file.
+        self._token = rospy.get_param('~token')
+        # self._oauth_token = rospy.get_param('~oath_token')
+        self._channel_id = None
+
+        self._message_to_ros_publisher = rospy.Publisher('message_to_ros', String, queue_size=10)
+        self._message_from_ros_subscriber = rospy.Subscriber("message_from_ros", String, self._ros_string_callback)
+        self._image_to_ros_publisher = rospy.Publisher("image_to_ros", Image, queue_size=10)
+        self._image_from_ros_subscriber = rospy.Subscriber("image_from_ros", Image,
+                                                           self._ros_image_callback, queue_size=10)
+
+        # Set CvBridge
+        self._cv_bridge = CvBridge()
+
+        # Create the slack client
+        self._slack_client = SlackClient(self._token)
+        if not self._slack_client.rtm_connect():
+            raise Exception("Failed to connect to slack")
+        self._slack_bot_id = self._slack_client.api_call("auth.test")["user_id"]
+
+        rospy.loginfo("SlackROS initialized, bot_id {}".format(self._slack_bot_id))
+
+    def spin(self, rate):
+        rate = rospy.Rate(rate)
+        while not rospy.is_shutdown():
+            for update in self._slack_client.rtm_read():
+                if "text" in update and ("subtype" not in update or update["subtype"] != "bot_message"):
+                    if "file" in update and "upload" in update and update["upload"]:
+                        self._slack_photo_callback(update)
+                    elif update["text"] == "/start":
+                        self._slack_start_callback(update)
+                    else:
+                        self._slack_message_callback(update)
+
+            rate.sleep()
+
+    def _slack_start_callback(self, update):
+        if self._channel_id is not None and self._channel_id != update["channel"]:
+            rospy.logwarn("Changing to different channel_id!")
+            self._slack_client.api_call("chat.postMessage", channel=self._channel_id,
+                                        text="Lost ROS bridge connection to this channel_id (somebody took over)")
+
+        self._channel_id = update["channel"]
+
+        rospy.loginfo("Starting Slack ROS bridge for channel_id {}".format(self._channel_id))
+        self._slack_client.api_call("chat.postMessage", channel=self._channel_id,
+                                    text="Slack ROS bridge initialized, only replying to channel_id "
+                                         "{} (current)".format(self._channel_id))
+
+    def _slack_message_callback(self, update):
+        text = update["text"].encode('utf-8')
+        rospy.loginfo("Incoming message from slack: {}".format(text))
+        if self._channel_id is None:
+            rospy.logwarn("Discarding message. No active channel_id.")
+            self._slack_client.api_call("chat.postMessage", channel=update["channel"],
+                                        text="ROS Bridge not initialized. Type /start to set-up ROS bridge")
+        elif self._channel_id != update["channel"]:
+            rospy.logwarn("Discarding message. Invalid channel_id")
+            self._slack_client.api_call("chat.postMessage", channel=update["channel"],
+                                        text="ROS Bridge initialized to another channel_id. "
+                                             "Type /start to connect to this channel_id")
+        else:
+            self._message_to_ros_publisher.publish(String(data=text))
+
+    def _slack_photo_callback(self, update):
+        rospy.loginfo("Incoming photo from slack")
+        if self._channel_id is None:
+            rospy.logwarn("Discarding photo. No active channel_id.")
+            update.message.reply_text("ROS Bridge not initialized. Type /start to set-up ROS bridge")
+        elif self._channel_id != update["channel"]:
+            rospy.logwarn("Discarding photo. Invalid channel_id")
+            update.message.reply_text(
+                "ROS Bridge initialized to another channel_id. Type /start to connect to this channel_id")
+        else:
+            rospy.loginfo("Received image, downloading highest resolution image ...")
+            response = requests.get(update["file"]["url_private_download"],
+                                    headers={'Authorization': 'Bearer {}'.format(self._token)})
+            if response.status_code != 200:
+                rospy.logerr("Failed to download image")
+            else:
+                rospy.loginfo("Download complete, publishing ...")
+
+                img = cv2.imdecode(np.fromstring(response.content, np.uint8), cv2.IMREAD_COLOR)
+                msg = self._cv_bridge.cv2_to_imgmsg(img, encoding="bgr8")
+
+                self._image_to_ros_publisher.publish(msg)
+
+                try:
+                    text = update["file"]["initial_comment"]["comment"].encode('utf-8')
+                except:
+                    text = None
+                if text:
+                    self._message_to_ros_publisher.publish(String(data=text))
+
+    def _ros_string_callback(self, msg):
+        if not self._channel_id:
+            rospy.logerr("ROS Bridge not initialized, dropping string message")
+        else:
+            self._slack_client.api_call("chat.postMessage", channel=self._channel_id, text=msg.data)
+
+    def _ros_image_callback(self, msg):
+        if not self._channel_id:
+            rospy.logerr("ROS Bridge not initialized, dropping image message")
+        else:
+            cv2_img = self._cv_bridge.imgmsg_to_cv2(msg, "bgr8")
+            self._slack_client.api_call("files.upload", channels=self._channel_id,
+                                        file=StringIO(cv2.imencode('.jpg', cv2_img)[1].tostring()))
+
+
+# Main function.
+if __name__ == '__main__':
+    # Initialize the node and name it.
+    rospy.init_node('slack_ros')
+    # Go to class functions that do all the heavy lifting. Do error checking.
+    try:
+        sr = SlackROS()
+        sr.spin(rospy.get_param("~rate", 10))
+    except rospy.ROSInterruptException:
+        pass
