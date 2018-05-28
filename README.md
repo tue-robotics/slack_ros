@@ -12,5 +12,4 @@ Slack ROS Bridge
 * Install the app
 
 ## Usage
-* Use the 'bot user oauth access token' as the `token` parameter and run the `slack_ros_bridge` script.
- 
+* Use the 'bot user oauth access token' as the `token` parameter and run the `slack_ros_bridge` script: `rosrun slack_ros slack_ros_bridge _token:=<bot user oauth access token>`
